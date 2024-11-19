@@ -8,10 +8,18 @@ import numpy as np
 import json
 import os
 
-# with open("keys.json", "rb") as file:
-#     keys = json.load(file)
+ENV = "prod"
 
-jwt = os.environ.get("jwt", "pass")
+if ENV == "dev":
+
+    with open("keys.json", "rb") as file:
+        keys = json.load(file)
+
+    jwt = keys["jwt"]
+
+elif ENV == "prod":
+
+    jwt = os.environ.get("jwt", "pass")
 
 st.set_page_config(
     page_title="Card Trading Dashboard",
@@ -33,8 +41,9 @@ def get_expansions():
     response = requests.get(f"{base_url}/expansions", headers=headers)
     return pd.DataFrame(response.json())
 
+
 @st.cache(ttl=3600)
-def get_cards(expansion_id, language, min_condition):
+def get_cards(expansion_id, language, min_condition, hub_only):
     headers = {"Authorization": f"Bearer {jwt}"}
     response = requests.get(
         f"{base_url}/marketplace/products",
@@ -42,7 +51,6 @@ def get_cards(expansion_id, language, min_condition):
         headers=headers
     )
     
-    # Define condition hierarchy
     condition_order = {
         'Near Mint': 0,
         'Slightly Played': 1,
@@ -99,20 +107,24 @@ def get_cards(expansion_id, language, min_condition):
                 all_sellers_df = filtered_df[filtered_df.name_en == best_condition_df.name_en.iloc[0]]
                 has_hub_seller = all_sellers_df.can_sell_via_hub.any()
                 
+                # Skip if hub_only is True and card has no hub sellers
+                if hub_only and not has_hub_seller:
+                    continue
+                    
                 if has_hub_seller:
                     hub_cards_count += 1
-                    
-                # Get lowest non-hub price if available, otherwise use hub price
-                non_hub_price = None
-                hub_price = None
                 
-                if not all_sellers_df[all_sellers_df.can_sell_via_hub == False].empty:
-                    non_hub_price = all_sellers_df[all_sellers_df.can_sell_via_hub == False].cents.min() / 100
-                    
-                if not all_sellers_df[all_sellers_df.can_sell_via_hub == True].empty:
-                    hub_price = all_sellers_df[all_sellers_df.can_sell_via_hub == True].cents.min() / 100
-                
-                final_price = non_hub_price if non_hub_price is not None else hub_price
+                final_price = None
+                if hub_only:
+                    # Only consider hub sellers
+                    if not all_sellers_df[all_sellers_df.can_sell_via_hub == True].empty:
+                        final_price = all_sellers_df[all_sellers_df.can_sell_via_hub == True].cents.min() / 100
+                else:
+                    # Consider all sellers
+                    if not all_sellers_df[all_sellers_df.can_sell_via_hub == False].empty:
+                        final_price = all_sellers_df[all_sellers_df.can_sell_via_hub == False].cents.min() / 100
+                    elif not all_sellers_df[all_sellers_df.can_sell_via_hub == True].empty:
+                        final_price = all_sellers_df[all_sellers_df.can_sell_via_hub == True].cents.min() / 100
                 
                 if final_price is not None:
                     card_data = {
@@ -128,6 +140,7 @@ def get_cards(expansion_id, language, min_condition):
             continue
             
     return pd.DataFrame(total), hub_cards_count, condition_counts
+
 
 # Main app layout
 st.title("Card Trading Analysis Dashboard")
@@ -149,7 +162,7 @@ selected_game = st.sidebar.selectbox(
     options=games_df['display_name'].tolist(),
     index=default_game_idx
 )
-
+hub_only = st.sidebar.checkbox('Only Show Hub Sellers', value=False)
 game_id = games_df[games_df['display_name'] == selected_game]['id'].iloc[0]
 
 # Filter expansions
@@ -186,8 +199,12 @@ selected_min_condition = st.sidebar.selectbox(
 
 # Load card data
 with st.spinner('Fetching card data...'):
-    cards_df, hub_cards_count, condition_counts = get_cards(expansion_id, selected_language, selected_min_condition)
-
+    cards_df, hub_cards_count, condition_counts = get_cards(
+        expansion_id, 
+        selected_language, 
+        selected_min_condition,
+        hub_only
+    )
 # Display metrics
 col1, col2, col3 = st.columns(3)
 
