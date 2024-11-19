@@ -1,40 +1,40 @@
 import streamlit as st
 import pandas as pd
 import requests
+import plotly.colors as cl
 import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
+import json
+import os
 
-# Set page config
+# with open("keys.json", "rb") as file:
+#     keys = json.load(file)
+
+jwt = os.environ.get("jwt", "pass")
+
 st.set_page_config(
     page_title="Card Trading Dashboard",
     page_icon="🃏",
     layout="wide"
 )
 
-# Assuming jwt token is stored in environment variable or config
-jwt="eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJjYXJkdHJhZGVyLXByb2R1Y3Rpb24iLCJzdWIiOiJhcHA6MTI3ODEiLCJhdWQiOiJhcHA6MTI3ODEiLCJleHAiOjQ4ODc1Mzc4MTgsImp0aSI6IjIzNmVkYzRkLTJiZGMtNGYzMi05ZTgwLTU3OWQ2MGU5ZGM5YyIsImlhdCI6MTczMTg2NDIxOCwibmFtZSI6Ikd1c3RhcjggQXBwIDIwMjQxMTE3MTgyMzM4In0.uC93jLBpZjR7mPszmdbNSiQwZV5JrR-BRCDwp9FWfpXP9ip_zex8eyEGAIoZ7JHBpkuZPGZ2ezOVJPdYUCL1-JRr7S3pgkU-C4NMMPcJu3QRJ1mMbT0XcWBodnnnaY26uxFkRlXY-cKxmKV5ATR1KDs9hLWNE7mMKFx_-pNKwHvLp5P02WFWvLwkd76ZBRBubIJyFak0eRBn-344eb-2dD-t5gHJxDc7-vbnxlSqe1tTveqOThSEhzwJlVQDCQiUqOjy3ZnWeMLm3x1Wc36XhQbE-WpCZwGAbkPSXFp5UdcUTdJ9-ggktsHrwSCfGxjylPiGtPU5iLeTLzKhWf7wkw"
-
 base_url = "https://api.cardtrader.com/api/v2"
 
-# Cache the API calls to improve performance
 @st.cache(ttl=3600)
 def get_games():
-    """Fetch available games from the API"""
     headers = {"Authorization": f"Bearer {jwt}"}
     response = requests.get(f"{base_url}/games", headers=headers)
     return pd.DataFrame(response.json()['array'])
 
 @st.cache(ttl=3600)
 def get_expansions():
-    """Fetch all expansions from the API"""
     headers = {"Authorization": f"Bearer {jwt}"}
     response = requests.get(f"{base_url}/expansions", headers=headers)
     return pd.DataFrame(response.json())
 
 @st.cache(ttl=3600)
-def get_cards(expansion_id, language="it"):
-    """Fetch cards for a specific expansion"""
+def get_cards(expansion_id, language, min_condition):
     headers = {"Authorization": f"Bearer {jwt}"}
     response = requests.get(
         f"{base_url}/marketplace/products",
@@ -42,7 +42,23 @@ def get_cards(expansion_id, language="it"):
         headers=headers
     )
     
+    # Define condition hierarchy
+    condition_order = {
+        'Near Mint': 0,
+        'Slightly Played': 1,
+        'Moderately Played': 2,
+        'Played': 3,
+        'Poor': 4
+    }
+    
+    min_condition_value = condition_order[min_condition]
+    acceptable_conditions = [cond for cond, value in condition_order.items() 
+                           if value <= min_condition_value]
+    
+    condition_counts = {}
     total = []
+    hub_cards_count = 0
+    
     for payload in response.json().values():
         expanded_data = []
         for item in payload:
@@ -62,59 +78,87 @@ def get_cards(expansion_id, language="it"):
             
         df = pd.DataFrame(expanded_data)
         try:
-            filtered_df = (df
-                .query("can_sell_via_hub == True")
-                .query("pokemon_language == @language")
-                .query("condition == 'Near Mint'")
-                .sort_values(by="cents")
-            )
+            filtered_df = df[
+                (df.pokemon_language == language) &
+                (df.condition.isin(acceptable_conditions))
+            ].sort_values(by=["condition", "cents"])
+            
             if not filtered_df.empty:
-                card_data = {
-                    "name": filtered_df.name_en.iloc[0],
-                    "price": filtered_df.cents.iloc[0] / 100,  # Convert cents to currency
-                    "id": filtered_df.id_1.iloc[0]
-                }
-                total.append(card_data)
+                # Count conditions
+                card_conditions = filtered_df.condition.value_counts()
+                for cond, count in card_conditions.items():
+                    condition_counts[cond] = condition_counts.get(cond, 0) + 1
+                
+                # Get best condition available for each card
+                best_condition_df = filtered_df.sort_values(
+                    by="condition",
+                    key=lambda x: x.map(condition_order)
+                ).groupby('name_en').first().reset_index()
+                
+                # Check if any seller offers the card via hub
+                all_sellers_df = filtered_df[filtered_df.name_en == best_condition_df.name_en.iloc[0]]
+                has_hub_seller = all_sellers_df.can_sell_via_hub.any()
+                
+                if has_hub_seller:
+                    hub_cards_count += 1
+                    
+                # Get lowest non-hub price if available, otherwise use hub price
+                non_hub_price = None
+                hub_price = None
+                
+                if not all_sellers_df[all_sellers_df.can_sell_via_hub == False].empty:
+                    non_hub_price = all_sellers_df[all_sellers_df.can_sell_via_hub == False].cents.min() / 100
+                    
+                if not all_sellers_df[all_sellers_df.can_sell_via_hub == True].empty:
+                    hub_price = all_sellers_df[all_sellers_df.can_sell_via_hub == True].cents.min() / 100
+                
+                final_price = non_hub_price if non_hub_price is not None else hub_price
+                
+                if final_price is not None:
+                    card_data = {
+                        "name": best_condition_df.name_en.iloc[0],
+                        "price": final_price,
+                        "id": best_condition_df.id_1.iloc[0],
+                        "can_sell_via_hub": has_hub_seller,
+                        "condition": best_condition_df.condition.iloc[0],
+                        "price_std": filtered_df.cents.std() / 100
+                    }
+                    total.append(card_data)
         except:
             continue
             
-    return pd.DataFrame(total)
+    return pd.DataFrame(total), hub_cards_count, condition_counts
 
 # Main app layout
 st.title("Card Trading Analysis Dashboard")
 
-# Sidebar for filters
+# Sidebar filters
 st.sidebar.header("Filters")
 
 # Load games and expansions
 games_df = get_games()
 expansions_df = get_expansions()
 
-# Set default game (Pokémon)
+# Game selection
 default_game = "Pokémon"
 game_index = games_df[games_df['name'] == default_game].index.tolist()
 default_game_idx = 0 if not game_index else int(game_index[0])
 
-# Game selection
 selected_game = st.sidebar.selectbox(
     "Select Game",
     options=games_df['display_name'].tolist(),
     index=default_game_idx
 )
 
-# Get game ID
 game_id = games_df[games_df['display_name'] == selected_game]['id'].iloc[0]
 
-# Filter expansions for selected game
+# Filter expansions
 game_expansions = expansions_df[expansions_df['game_id'] == game_id]
 
-# Set default expansion (Base Set)
+# Expansion selection
 default_expansion = "Base Set"
 expansion_list = game_expansions['name'].tolist()
-try:
-    default_exp_idx = expansion_list.index(default_expansion)
-except ValueError:
-    default_exp_idx = 0
+default_exp_idx = expansion_list.index(default_expansion) if default_expansion in expansion_list else 0
 
 selected_expansion = st.sidebar.selectbox(
     "Select Expansion",
@@ -122,25 +166,30 @@ selected_expansion = st.sidebar.selectbox(
     index=default_exp_idx
 )
 
-# Get expansion ID
 expansion_id = game_expansions[game_expansions['name'] == selected_expansion]['id'].iloc[0]
 
 # Language selection
-languages = ['en', 'it', 'fr', 'de', 'es', "jp"]
-default_lang_idx = languages.index('it')  # Set Italian as default
-
+languages = ['en', 'it', 'fr', 'de', 'es', 'jp']
 selected_language = st.sidebar.selectbox(
     "Select Language",
     options=languages,
-    index=default_lang_idx
+    index=languages.index('it')
+)
+
+# Condition selection
+conditions = ['Near Mint', 'Slightly Played', 'Moderately Played', 'Played', 'Poor']
+selected_min_condition = st.sidebar.selectbox(
+    "Select Minimum Condition",
+    options=conditions,
+    index=0
 )
 
 # Load card data
 with st.spinner('Fetching card data...'):
-    cards_df = get_cards(expansion_id, selected_language)
+    cards_df, hub_cards_count, condition_counts = get_cards(expansion_id, selected_language, selected_min_condition)
 
 # Display metrics
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 
 with col1:
     st.metric(
@@ -156,21 +205,22 @@ with col2:
         f"Median: €{cards_df['price'].median():,.2f}"
     )
 
+with col3:
+    st.metric(
+        "Hub-only Cards",
+        f"{hub_cards_count}",
+        f"{(hub_cards_count/len(cards_df)*100):.1f}% of total"
+    )
 
-# [Previous code remains the same until the visualization part]
+# Add condition breakdown
+st.subheader("Cards by Condition")
+for condition in conditions:
+    if condition in condition_counts:
+        st.text(f"{condition}: {condition_counts[condition]} cards")
 
-# Create bar chart of top 10 most expensive cards with error bars
+# Top 10 cards visualization
 top_10_cards = cards_df.nlargest(10, 'price')
-
-# Calculate standard deviation
-std_dev = cards_df['price'].std()
-error_bars = [std_dev] * len(top_10_cards)
-
-# Create color scale based on prices
-colors = px.colors.sequential.Viridis
-normalized_prices = (top_10_cards['price'] - top_10_cards['price'].min()) / (top_10_cards['price'].max() - top_10_cards['price'].min())
-bar_colors = [colors[int(np * (len(colors)-1))] for np in normalized_prices]
-
+colors = cl.sequential.Viridis
 fig = go.Figure(data=[
     go.Bar(
         name='Price',
@@ -178,18 +228,21 @@ fig = go.Figure(data=[
         y=top_10_cards['price'],
         error_y=dict(
             type='data',
-            array=error_bars,
+            array=top_10_cards['price_std'] / 1000,
             visible=True,
             color='darkgray',
             thickness=1.5,
             width=3
         ),
         marker=dict(
-            color=bar_colors
+            color=[colors[int(np * (len(colors)-1))] for np in (
+                (top_10_cards['price'] - top_10_cards['price'].min()) / 
+                (top_10_cards['price'].max() - top_10_cards['price'].min())
+            )]
         ),
         hovertemplate="<b>%{x}</b><br>" +
                       "Price: €%{y:.2f}<br>" +
-                      f"Std Dev: €{std_dev:.2f}<br>" +
+                      "Std Dev: €%{error_y.array:.2f}<br>" +
                       "<extra></extra>"
     )
 ])
@@ -207,31 +260,30 @@ fig.update_layout(
 
 st.plotly_chart(fig)
 
-# Add slider for top N expensive cards
+# Top N cards section
 st.header("Top N Most Expensive Cards")
 n_cards = st.slider(
     "Select number of cards to display",
     min_value=1,
-    max_value=min(50, len(cards_df)),  # Don't allow more than 50 or the total number of cards
-    value=10  # Default value
+    max_value=min(50, len(cards_df)),
+    value=10
 )
 
-# Display top N cards table with additional statistics
 top_n_cards = cards_df.nlargest(n_cards, 'price').copy()
 top_n_cards['Price'] = top_n_cards['price'].apply(lambda x: f"€{x:,.2f}")
+top_n_cards['Std Dev'] = top_n_cards['price_std'].apply(lambda x: f"€{x:,.2f}")
 top_n_cards['Relative to Average'] = (top_n_cards['price'] / top_n_cards['price'].mean()).apply(lambda x: f"{x:.2f}x")
+top_n_cards['Hub Only'] = top_n_cards['can_sell_via_hub'].apply(lambda x: 'Yes' if x else 'No')
 
-# Create a nicely formatted table
-display_df = top_n_cards[['name', 'Price', 'Relative to Average']].copy()
-display_df.columns = ['Card Name', 'Price', 'Relative to Average']
+display_df = top_n_cards[['name', 'Price', 'condition', 'Std Dev', 'Relative to Average', 'Hub Only']].copy()
+display_df.columns = ['Card Name', 'Price', 'Condition', 'Std Dev', 'Relative to Average', 'Hub Only']
 
-# Simple dataframe display
 st.dataframe(display_df)
 
-# Show summary statistics
 st.caption(f"""
     Statistics for top {n_cards} cards:
-    - Total Value: €{top_n_cards['price'].sum():,.2f}
-    - Average Price: €{top_n_cards['price'].mean():,.2f}
-    - Price Range: €{top_n_cards['price'].min():,.2f} - €{top_n_cards['price'].max():,.2f}
+    - Total Value: €{top_n_cards['price'].astype(float).sum():,.2f}
+    - Average Price: €{top_n_cards['price'].astype(float).mean():,.2f}
+    - Price Range: €{top_n_cards['price'].astype(float).min():,.2f} - €{top_n_cards['price'].astype(float).max():,.2f}
+    - Hub-only Cards: {top_n_cards['can_sell_via_hub'].sum()} ({(top_n_cards['can_sell_via_hub'].sum()/len(top_n_cards)*100):.1f}%)
 """)
